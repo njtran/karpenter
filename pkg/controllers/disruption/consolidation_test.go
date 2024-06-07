@@ -33,11 +33,8 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"knative.dev/pkg/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha5"
 	"sigs.k8s.io/karpenter/pkg/apis/v1beta1"
@@ -76,8 +73,8 @@ var _ = Describe("Consolidation", func() {
 				Labels: map[string]string{
 					v1beta1.NodePoolLabelKey:     nodePool.Name,
 					v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-					v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-					v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+					v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 				},
 			},
 			Status: v1beta1.NodeClaimStatus{
@@ -89,8 +86,8 @@ var _ = Describe("Consolidation", func() {
 				Labels: map[string]string{
 					v1beta1.NodePoolLabelKey:     nodePool.Name,
 					v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-					v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-					v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+					v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 				},
 			},
 			Status: v1beta1.NodeClaimStatus{
@@ -111,7 +108,7 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			Expect(recorder.Calls("Unconsolidatable")).To(Equal(0))
@@ -126,12 +123,59 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// We get six calls here because we have Nodes and NodeClaims that fired for this event
 			// and each of the consolidation mechanisms specifies that this event should be fired
 			Expect(recorder.Calls("Unconsolidatable")).To(Equal(6))
+		})
+	})
+	Context("Metrics", func() {
+		var consolidationTypes = []string{"empty", "single", "multi"}
+		It("should correctly report eligible nodes", func() {
+			pod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1beta1.DoNotDisruptAnnotationKey: "true",
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*v1.Node{node}, []*v1beta1.NodeClaim{nodeClaim})
+
+			fakeClock.Step(10 * time.Minute)
+			wg := sync.WaitGroup{}
+			ExpectTriggerVerifyAction(&wg)
+			ExpectSingletonReconciled(ctx, disruptionController)
+			wg.Wait()
+
+			for _, ct := range consolidationTypes {
+				ExpectMetricGaugeValue(disruption.EligibleNodesGauge, 0, map[string]string{
+					"method":             "consolidation",
+					"consolidation_type": ct,
+				})
+			}
+
+			// remove the do-not-disrupt annotation to make the node eligible for consolidation and update cluster state
+			pod.SetAnnotations(map[string]string{})
+			ExpectApplied(ctx, env.Client, pod)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*v1.Node{node}, []*v1beta1.NodeClaim{nodeClaim})
+
+			fakeClock.Step(10 * time.Minute)
+			ExpectTriggerVerifyAction(&wg)
+			ExpectSingletonReconciled(ctx, disruptionController)
+			wg.Wait()
+
+			for _, ct := range consolidationTypes {
+				ExpectMetricGaugeValue(disruption.EligibleNodesGauge, 1, map[string]string{
+					"method":             "consolidation",
+					"consolidation_type": ct,
+				})
+			}
 		})
 	})
 	Context("Budgets", func() {
@@ -145,8 +189,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -173,7 +217,7 @@ var _ = Describe("Consolidation", func() {
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
 
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			metric, found := FindMetricWithLabelValues("karpenter_disruption_budgets_allowed_disruptions", map[string]string{
@@ -183,7 +227,7 @@ var _ = Describe("Consolidation", func() {
 			Expect(metric.GetGauge().GetValue()).To(BeNumerically("==", 3))
 
 			// Execute command, thus deleting 3 nodes
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(7))
 		})
 		It("should allow all empty nodes to be disrupted", func() {
@@ -199,7 +243,7 @@ var _ = Describe("Consolidation", func() {
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
 
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			metric, found := FindMetricWithLabelValues("karpenter_disruption_budgets_allowed_disruptions", map[string]string{
@@ -209,7 +253,7 @@ var _ = Describe("Consolidation", func() {
 			Expect(metric.GetGauge().GetValue()).To(BeNumerically("==", 10))
 
 			// Execute command, thus deleting all nodes
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(0))
 		})
 		It("should allow no empty nodes to be disrupted", func() {
@@ -225,7 +269,7 @@ var _ = Describe("Consolidation", func() {
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
 
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			metric, found := FindMetricWithLabelValues("karpenter_disruption_budgets_allowed_disruptions", map[string]string{
@@ -235,7 +279,7 @@ var _ = Describe("Consolidation", func() {
 			Expect(metric.GetGauge().GetValue()).To(BeNumerically("==", 0))
 
 			// Execute command, thus deleting all nodes
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(numNodes))
 		})
 		It("should only allow 3 nodes to be deleted in multi node consolidation delete", func() {
@@ -262,8 +306,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			for i := 0; i < numNodes; i++ {
@@ -276,11 +320,11 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Execute command, thus deleting 3 nodes
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(7))
 		})
 		It("should only allow 3 nodes to be deleted in single node consolidation delete", func() {
@@ -307,8 +351,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			for i := 0; i < numNodes; i++ {
@@ -323,13 +367,13 @@ var _ = Describe("Consolidation", func() {
 			// Reconcile 5 times, enqueuing 3 commands total.
 			for i := 0; i < 5; i++ {
 				ExpectTriggerVerifyAction(&wg)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}
 			wg.Wait()
 
 			// Execute all commands in the queue, only deleting 3 nodes
 			for i := 0; i < 5; i++ {
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 			}
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(7))
 		})
@@ -359,8 +403,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     np.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -383,7 +427,7 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			for _, np := range nps {
@@ -395,7 +439,7 @@ var _ = Describe("Consolidation", func() {
 			}
 
 			// Execute the command in the queue, only deleting 20 node claims
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(10))
 		})
 		It("should allow all nodes from each nodePool to be deleted", func() {
@@ -423,8 +467,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     np.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -447,7 +491,7 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			for _, np := range nps {
@@ -459,7 +503,7 @@ var _ = Describe("Consolidation", func() {
 			}
 
 			// Execute the command in the queue, deleting all node claims
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(0))
 		})
 		It("should allow no nodes from each nodePool to be deleted", func() {
@@ -487,8 +531,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     np.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -511,7 +555,7 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			for _, np := range nps {
@@ -523,7 +567,7 @@ var _ = Describe("Consolidation", func() {
 			}
 
 			// Execute the command in the queue, deleting all node claims
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(30))
 		})
 		It("should not mark empty node consolidated if the candidates can't be disrupted due to budgets with one nodepool", func() {
@@ -578,8 +622,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     np.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -669,8 +713,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     np.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -760,8 +804,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     np.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -810,8 +854,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -832,10 +876,10 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -854,10 +898,10 @@ var _ = Describe("Consolidation", func() {
 			fakeClock.Step(10 * time.Minute)
 			wg := sync.WaitGroup{}
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim, nodeClaim2)
@@ -882,8 +926,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   largeCheapType.Name,
-						v1beta1.CapacityTypeLabelKey: largeCheapType.Offerings[0].CapacityType,
-						v1.LabelTopologyZone:         largeCheapType.Offerings[0].Zone,
+						v1beta1.CapacityTypeLabelKey: largeCheapType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         largeCheapType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -918,7 +962,7 @@ var _ = Describe("Consolidation", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*v1.Node{node}, []*v1beta1.NodeClaim{nodeClaim})
 
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// we don't need any new nodes and consolidation should notice the huge pending pod that needs the large
 			// node to schedule, which prevents the large expensive node from being replaced
@@ -930,13 +974,13 @@ var _ = Describe("Consolidation", func() {
 			// assign the nodeclaims to the least expensive offering so we don't get a replacement
 			nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-				v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 			node.Labels = lo.Assign(node.Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-				v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			ds := test.DaemonSet()
@@ -951,8 +995,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "DaemonSet",
 							Name:               ds.Name,
 							UID:                ds.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -969,10 +1013,10 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -986,13 +1030,13 @@ var _ = Describe("Consolidation", func() {
 			// assign the nodeclaims to the least expensive offering so we don't get a replacement
 			nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-				v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 			node.Labels = lo.Assign(node.Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-				v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			rs := test.ReplicaSet()
@@ -1007,8 +1051,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -1034,10 +1078,10 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -1051,13 +1095,13 @@ var _ = Describe("Consolidation", func() {
 			// assign the nodeclaims to the least expensive offering so we don't get a replacement
 			nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-				v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 			node.Labels = lo.Assign(node.Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-				v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			ss := test.StatefulSet()
@@ -1072,8 +1116,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "StatefulSet",
 							Name:               ss.Name,
 							UID:                ss.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -1094,10 +1138,10 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -1127,8 +1171,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 				ExpectApplied(ctx, env.Client, rs, pod, node, nodeClaim, nodePool)
@@ -1145,11 +1189,11 @@ var _ = Describe("Consolidation", func() {
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
 				// Process the item so that the nodes can be deleted.
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -1177,10 +1221,11 @@ var _ = Describe("Consolidation", func() {
 			// Forcefully assign lowest possible instancePrice to make sure we have atleast one instance
 			// that is lower than the current node.
 			cloudProvider.InstanceTypes[0].Offerings[0].Price = 0.001
-			cloudProvider.InstanceTypes[0].Offerings[0].CapacityType = v1beta1.CapacityTypeSpot
+			cloudProvider.InstanceTypes[0].Offerings[0].Requirements[v1beta1.CapacityTypeLabelKey] = scheduling.NewRequirement(
+				v1beta1.CapacityTypeLabelKey, v1.NodeSelectorOpIn, v1beta1.CapacityTypeSpot)
 			spotInstances = lo.Filter(cloudProvider.InstanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
 				for _, o := range i.Offerings {
-					if o.CapacityType == v1beta1.CapacityTypeSpot {
+					if o.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any() == v1beta1.CapacityTypeSpot {
 						return true
 					}
 				}
@@ -1195,15 +1240,15 @@ var _ = Describe("Consolidation", func() {
 			spotNodeClaim.Labels = lo.Assign(spotNodeClaim.Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelInstanceTypeStable:   mostExpSpotInstance.Name,
-				v1beta1.CapacityTypeLabelKey: mostExpSpotOffering.CapacityType,
-				v1.LabelTopologyZone:         mostExpSpotOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: mostExpSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         mostExpSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			spotNode.Labels = lo.Assign(spotNode.Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelInstanceTypeStable:   mostExpSpotInstance.Name,
-				v1beta1.CapacityTypeLabelKey: mostExpSpotOffering.CapacityType,
-				v1.LabelTopologyZone:         mostExpSpotOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: mostExpSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         mostExpSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			rs := test.ReplicaSet()
@@ -1218,8 +1263,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			ExpectApplied(ctx, env.Client, rs, pod, spotNode, spotNodeClaim, nodePool)
@@ -1235,8 +1280,8 @@ var _ = Describe("Consolidation", func() {
 			// consolidation won't delete the old nodeclaim until the new nodeclaim is ready
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
-			ExpectReconcileSucceeded(ctx, queue, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
+			ExpectSingletonReconciled(ctx, queue)
 			wg.Wait()
 
 			// shouldn't delete the node
@@ -1264,8 +1309,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			ExpectApplied(ctx, env.Client, rs, pod, spotNode, spotNodeClaim, nodePool)
@@ -1281,8 +1326,8 @@ var _ = Describe("Consolidation", func() {
 			// consolidation won't delete the old nodeclaim until the new nodeclaim is ready
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
-			ExpectReconcileSucceeded(ctx, queue, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
+			ExpectSingletonReconciled(ctx, queue)
 			wg.Wait()
 
 			// shouldn't delete the node
@@ -1299,14 +1344,15 @@ var _ = Describe("Consolidation", func() {
 			// Forcefully assign lowest possible instancePrice to make sure we have atleast one instance
 			// that is lower than the current node.
 			cloudProvider.InstanceTypes[0].Offerings[0].Price = 0.001
-			cloudProvider.InstanceTypes[0].Offerings[0].CapacityType = v1beta1.CapacityTypeSpot
+			cloudProvider.InstanceTypes[0].Offerings[0].Requirements[v1beta1.CapacityTypeLabelKey] = scheduling.NewRequirement(
+				v1beta1.CapacityTypeLabelKey, v1.NodeSelectorOpIn, v1beta1.CapacityTypeSpot)
 			// Also sort the cloud provider instances by pricing from low to high
 			sort.Slice(cloudProvider.InstanceTypes, func(i, j int) bool {
 				return cloudProvider.InstanceTypes[i].Offerings.Cheapest().Price < cloudProvider.InstanceTypes[j].Offerings.Cheapest().Price
 			})
 			spotInstances = lo.Filter(cloudProvider.InstanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
 				for _, o := range i.Offerings {
-					if o.CapacityType == v1beta1.CapacityTypeSpot {
+					if o.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any() == v1beta1.CapacityTypeSpot {
 						return true
 					}
 				}
@@ -1318,15 +1364,15 @@ var _ = Describe("Consolidation", func() {
 			spotNodeClaim.Labels = lo.Assign(spotNodeClaim.Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelInstanceTypeStable:   spotInstance.Name,
-				v1beta1.CapacityTypeLabelKey: spotOffering.CapacityType,
-				v1.LabelTopologyZone:         spotOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: spotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         spotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			spotNode.Labels = lo.Assign(spotNode.Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelInstanceTypeStable:   spotInstance.Name,
-				v1beta1.CapacityTypeLabelKey: spotOffering.CapacityType,
-				v1.LabelTopologyZone:         spotOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: spotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         spotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			rs := test.ReplicaSet()
@@ -1341,8 +1387,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			ExpectApplied(ctx, env.Client, rs, pod, spotNode, spotNodeClaim, nodePool)
@@ -1358,7 +1404,7 @@ var _ = Describe("Consolidation", func() {
 			// consolidation won't delete the old nodeclaim until the new nodeclaim is ready
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// we didn't create a new nodeclaim or delete the old one
@@ -1371,7 +1417,7 @@ var _ = Describe("Consolidation", func() {
 			// Fetch 18 spot instances
 			spotInstances = lo.Slice(lo.Filter(cloudProvider.InstanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
 				for _, o := range i.Offerings {
-					if o.CapacityType == v1beta1.CapacityTypeSpot {
+					if o.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any() == v1beta1.CapacityTypeSpot {
 						return true
 					}
 				}
@@ -1407,15 +1453,15 @@ var _ = Describe("Consolidation", func() {
 			spotNodeClaim.Labels = lo.Assign(spotNodeClaim.Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelInstanceTypeStable:   mostExpensiveInstanceType.Name,
-				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].CapacityType,
-				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Zone,
+				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			spotNode.Labels = lo.Assign(spotNode.Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelInstanceTypeStable:   mostExpensiveInstanceType.Name,
-				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].CapacityType,
-				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Zone,
+				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			rs := test.ReplicaSet()
@@ -1430,8 +1476,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			ExpectApplied(ctx, env.Client, rs, pod, spotNode, spotNodeClaim, nodePool)
@@ -1448,11 +1494,11 @@ var _ = Describe("Consolidation", func() {
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
@@ -1496,7 +1542,7 @@ var _ = Describe("Consolidation", func() {
 			// Fetch 18 spot instances
 			spotInstances = lo.Slice(lo.Filter(cloudProvider.InstanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
 				for _, o := range i.Offerings {
-					if o.CapacityType == v1beta1.CapacityTypeSpot {
+					if o.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any() == v1beta1.CapacityTypeSpot {
 						return true
 					}
 				}
@@ -1532,15 +1578,15 @@ var _ = Describe("Consolidation", func() {
 			spotNodeClaim.Labels = lo.Assign(spotNodeClaim.Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelInstanceTypeStable:   mostExpensiveInstanceType.Name,
-				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].CapacityType,
-				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Zone,
+				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			spotNode.Labels = lo.Assign(spotNode.Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelInstanceTypeStable:   mostExpensiveInstanceType.Name,
-				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].CapacityType,
-				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Zone,
+				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			rs := test.ReplicaSet()
@@ -1555,8 +1601,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			ExpectApplied(ctx, env.Client, rs, pod, spotNode, spotNodeClaim, nodePool)
@@ -1573,11 +1619,11 @@ var _ = Describe("Consolidation", func() {
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
@@ -1621,7 +1667,7 @@ var _ = Describe("Consolidation", func() {
 			// Fetch 18 spot instances
 			spotInstances = lo.Slice(lo.Filter(cloudProvider.InstanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
 				for _, o := range i.Offerings {
-					if o.CapacityType == v1beta1.CapacityTypeSpot {
+					if o.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any() == v1beta1.CapacityTypeSpot {
 						return true
 					}
 				}
@@ -1657,15 +1703,15 @@ var _ = Describe("Consolidation", func() {
 			spotNodeClaim.Labels = lo.Assign(spotNodeClaim.Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelInstanceTypeStable:   mostExpensiveInstanceType.Name,
-				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].CapacityType,
-				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Zone,
+				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			spotNode.Labels = lo.Assign(spotNode.Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelInstanceTypeStable:   mostExpensiveInstanceType.Name,
-				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].CapacityType,
-				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Zone,
+				v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			rs := test.ReplicaSet()
@@ -1680,8 +1726,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			ExpectApplied(ctx, env.Client, rs, pod, spotNode, spotNodeClaim, nodePool)
@@ -1698,11 +1744,11 @@ var _ = Describe("Consolidation", func() {
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
@@ -1760,29 +1806,29 @@ var _ = Describe("Consolidation", func() {
 				spotNodeClaim.Labels = lo.Assign(spotNodeClaim.Labels, map[string]string{
 					v1beta1.NodePoolLabelKey:     nodePool.Name,
 					v1.LabelInstanceTypeStable:   mostExpensiveInstanceType.Name,
-					v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].CapacityType,
-					v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Zone,
+					v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 				})
 
 				spotNode.Labels = lo.Assign(spotNode.Labels, map[string]string{
 					v1beta1.NodePoolLabelKey:     nodePool.Name,
 					v1.LabelInstanceTypeStable:   mostExpensiveInstanceType.Name,
-					v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].CapacityType,
-					v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Zone,
+					v1beta1.CapacityTypeLabelKey: mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         mostExpensiveInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 				})
 
 				nodeClaim.Labels = lo.Assign(spotNodeClaim.Labels, map[string]string{
 					v1beta1.NodePoolLabelKey:     nodePool.Name,
 					v1.LabelInstanceTypeStable:   mostExpensiveODInstanceType.Name,
-					v1beta1.CapacityTypeLabelKey: mostExpensiveODInstanceType.Offerings[0].CapacityType,
-					v1.LabelTopologyZone:         mostExpensiveODInstanceType.Offerings[0].Zone,
+					v1beta1.CapacityTypeLabelKey: mostExpensiveODInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         mostExpensiveODInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 				})
 
 				node.Labels = lo.Assign(spotNode.Labels, map[string]string{
 					v1beta1.NodePoolLabelKey:     nodePool.Name,
 					v1.LabelInstanceTypeStable:   mostExpensiveODInstanceType.Name,
-					v1beta1.CapacityTypeLabelKey: mostExpensiveODInstanceType.Offerings[0].CapacityType,
-					v1.LabelTopologyZone:         mostExpensiveODInstanceType.Offerings[0].Zone,
+					v1beta1.CapacityTypeLabelKey: mostExpensiveODInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         mostExpensiveODInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 				})
 
 				nodeClaim = lo.Ternary(spotToSpot, spotNodeClaim, nodeClaim)
@@ -1802,8 +1848,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 				ExpectApplied(ctx, env.Client, rs, pod, spotNode, spotNodeClaim, nodePool)
@@ -1819,7 +1865,7 @@ var _ = Describe("Consolidation", func() {
 				// consolidation won't delete the old nodeclaim until the new nodeclaim is ready
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
 				// we didn't create a new nodeclaim or delete the old one
@@ -1848,8 +1894,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 
@@ -1869,11 +1915,11 @@ var _ = Describe("Consolidation", func() {
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
 				// Process the item so that the nodes can be deleted.
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -1913,8 +1959,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 				pdb := test.PodDisruptionBudget(test.PDBOptions{
@@ -1941,7 +1987,7 @@ var _ = Describe("Consolidation", func() {
 
 				fakeClock.Step(10 * time.Minute)
 
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 
 				// we didn't create a new nodeclaim or delete the old one
 				Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
@@ -1973,8 +2019,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 
@@ -2021,11 +2067,11 @@ var _ = Describe("Consolidation", func() {
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
 				// Process the item so that the nodes can be deleted.
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -2061,8 +2107,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 
@@ -2095,11 +2141,11 @@ var _ = Describe("Consolidation", func() {
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
 				// Process the item so that the nodes can be deleted.
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -2130,8 +2176,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						},
 					},
@@ -2149,8 +2195,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     nodePool.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -2164,13 +2210,13 @@ var _ = Describe("Consolidation", func() {
 				if spotToSpot {
 					annotatedNodeClaim.Labels = lo.Assign(annotatedNodeClaim.Labels, map[string]string{
 						v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					})
 					annotatedNode.Labels = lo.Assign(annotatedNode.Labels, map[string]string{
 						v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					})
 				}
 
@@ -2190,10 +2236,10 @@ var _ = Describe("Consolidation", func() {
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
@@ -2223,8 +2269,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						},
 					},
@@ -2242,8 +2288,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     nodePool.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -2257,13 +2303,13 @@ var _ = Describe("Consolidation", func() {
 				if spotToSpot {
 					annotatedNodeClaim.Labels = lo.Assign(annotatedNodeClaim.Labels, map[string]string{
 						v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					})
 					annotatedNode.Labels = lo.Assign(annotatedNode.Labels, map[string]string{
 						v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					})
 				}
 
@@ -2283,10 +2329,10 @@ var _ = Describe("Consolidation", func() {
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 				// Cascade any deletion of the nodeClaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
@@ -2316,8 +2362,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						},
 					},
@@ -2332,8 +2378,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     nodePool.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -2347,13 +2393,13 @@ var _ = Describe("Consolidation", func() {
 				if spotToSpot {
 					nodeClaim2.Labels = lo.Assign(nodeClaim2.Labels, map[string]string{
 						v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					})
 					node2.Labels = lo.Assign(node2.Labels, map[string]string{
 						v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					})
 				}
 				// Block this pod from being disrupted with karpenter.sh/do-not-evict
@@ -2375,10 +2421,10 @@ var _ = Describe("Consolidation", func() {
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 				// Cascade any deletion of the nodeClaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
@@ -2408,8 +2454,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						},
 					},
@@ -2424,8 +2470,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     nodePool.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -2438,13 +2484,13 @@ var _ = Describe("Consolidation", func() {
 				if spotToSpot {
 					nodeClaim2.Labels = lo.Assign(nodeClaim2.Labels, map[string]string{
 						v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					})
 					node2.Labels = lo.Assign(node2.Labels, map[string]string{
 						v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					})
 				}
 				// Block this pod from being disrupted with karpenter.sh/do-not-disrupt
@@ -2466,10 +2512,10 @@ var _ = Describe("Consolidation", func() {
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -2487,8 +2533,7 @@ var _ = Describe("Consolidation", func() {
 				Name: "current-on-demand",
 				Offerings: []cloudprovider.Offering{
 					{
-						CapacityType: v1beta1.CapacityTypeOnDemand,
-						Zone:         "test-zone-1a",
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1beta1.CapacityTypeLabelKey: v1beta1.CapacityTypeOnDemand, v1.LabelTopologyZone: "test-zone-1a"}),
 						Price:        0.5,
 						Available:    false,
 					},
@@ -2498,20 +2543,17 @@ var _ = Describe("Consolidation", func() {
 				Name: "potential-spot-replacement",
 				Offerings: []cloudprovider.Offering{
 					{
-						CapacityType: v1beta1.CapacityTypeSpot,
-						Zone:         "test-zone-1a",
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1beta1.CapacityTypeLabelKey: v1beta1.CapacityTypeSpot, v1.LabelTopologyZone: "test-zone-1a"}),
 						Price:        1.0,
 						Available:    true,
 					},
 					{
-						CapacityType: v1beta1.CapacityTypeSpot,
-						Zone:         "test-zone-1b",
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1beta1.CapacityTypeLabelKey: v1beta1.CapacityTypeSpot, v1.LabelTopologyZone: "test-zone-1b"}),
 						Price:        0.2,
 						Available:    true,
 					},
 					{
-						CapacityType: v1beta1.CapacityTypeSpot,
-						Zone:         "test-zone-1c",
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1beta1.CapacityTypeLabelKey: v1beta1.CapacityTypeSpot, v1.LabelTopologyZone: "test-zone-1c"}),
 						Price:        0.4,
 						Available:    true,
 					},
@@ -2535,8 +2577,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			nodeClaim, node = test.NodeClaimAndNode(v1beta1.NodeClaim{
@@ -2544,8 +2586,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   currentInstance.Name,
-						v1beta1.CapacityTypeLabelKey: currentInstance.Offerings[0].CapacityType,
-						v1.LabelTopologyZone:         currentInstance.Offerings[0].Zone,
+						v1beta1.CapacityTypeLabelKey: currentInstance.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         currentInstance.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -2564,7 +2606,7 @@ var _ = Describe("Consolidation", func() {
 			fakeClock.Step(10 * time.Minute)
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Expect to not create or delete more nodeclaims
@@ -2578,8 +2620,7 @@ var _ = Describe("Consolidation", func() {
 				Name: "current-on-demand",
 				Offerings: []cloudprovider.Offering{
 					{
-						CapacityType: v1beta1.CapacityTypeOnDemand,
-						Zone:         "test-zone-1a",
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1beta1.CapacityTypeLabelKey: v1beta1.CapacityTypeOnDemand, v1.LabelTopologyZone: "test-zone-1a"}),
 						Price:        0.5,
 						Available:    false,
 					},
@@ -2589,26 +2630,22 @@ var _ = Describe("Consolidation", func() {
 				Name: "on-demand-replacement",
 				Offerings: []cloudprovider.Offering{
 					{
-						CapacityType: v1beta1.CapacityTypeOnDemand,
-						Zone:         "test-zone-1a",
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1beta1.CapacityTypeLabelKey: v1beta1.CapacityTypeOnDemand, v1.LabelTopologyZone: "test-zone-1a"}),
 						Price:        0.6,
 						Available:    true,
 					},
 					{
-						CapacityType: v1beta1.CapacityTypeOnDemand,
-						Zone:         "test-zone-1b",
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1beta1.CapacityTypeLabelKey: v1beta1.CapacityTypeOnDemand, v1.LabelTopologyZone: "test-zone-1b"}),
 						Price:        0.6,
 						Available:    true,
 					},
 					{
-						CapacityType: v1beta1.CapacityTypeSpot,
-						Zone:         "test-zone-1b",
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1beta1.CapacityTypeLabelKey: v1beta1.CapacityTypeSpot, v1.LabelTopologyZone: "test-zone-1b"}),
 						Price:        0.2,
 						Available:    true,
 					},
 					{
-						CapacityType: v1beta1.CapacityTypeSpot,
-						Zone:         "test-zone-1c",
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1beta1.CapacityTypeLabelKey: v1beta1.CapacityTypeSpot, v1.LabelTopologyZone: "test-zone-1c"}),
 						Price:        0.3,
 						Available:    true,
 					},
@@ -2633,8 +2670,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 
@@ -2653,8 +2690,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   currentInstance.Name,
-						v1beta1.CapacityTypeLabelKey: currentInstance.Offerings[0].CapacityType,
-						v1.LabelTopologyZone:         currentInstance.Offerings[0].Zone,
+						v1beta1.CapacityTypeLabelKey: currentInstance.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         currentInstance.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -2673,7 +2710,7 @@ var _ = Describe("Consolidation", func() {
 			fakeClock.Step(10 * time.Minute)
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Expect to not create or delete more nodeclaims
@@ -2693,8 +2730,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -2717,8 +2754,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], pods[2], nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], nodePool)
@@ -2735,11 +2772,11 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -2762,8 +2799,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			nodeClassNodePool := test.NodePool()
@@ -2782,11 +2819,11 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -2816,8 +2853,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -2836,11 +2873,11 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
@@ -2865,8 +2902,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 
@@ -2898,11 +2935,11 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
@@ -2928,8 +2965,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			nodeClaims[1].Annotations = lo.Assign(nodeClaims[1].Annotations, map[string]string{v1alpha5.DoNotConsolidateNodeAnnotationKey: "true"})
@@ -2950,10 +2987,10 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			// Cascade any deletion of the nodeClaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
 
@@ -2976,8 +3013,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			nodeClaims[1].Annotations = lo.Assign(nodeClaims[1].Annotations, map[string]string{v1beta1.DoNotDisruptAnnotationKey: "true"})
@@ -2998,10 +3035,10 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			// Cascade any deletion of the nodeClaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
 
@@ -3025,8 +3062,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				}})
@@ -3048,10 +3085,10 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			// Cascade any deletion of the nodeClaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
 
@@ -3074,8 +3111,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			// Block this pod from being disrupted with karpenter.sh/do-not-disrupt
@@ -3096,10 +3133,10 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
@@ -3123,8 +3160,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 
@@ -3145,11 +3182,11 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -3161,7 +3198,7 @@ var _ = Describe("Consolidation", func() {
 			// and will not be recreated
 			ExpectNotFound(ctx, env.Client, nodeClaims[1], nodes[1])
 		})
-		It("won't delete node if it would require pods to schedule on an un-initialized node", func() {
+		It("won't delete node if it would require pods to schedule on an uninitialized node", func() {
 			// create our RS so we can link a pod to it
 			rs := test.ReplicaSet()
 			ExpectApplied(ctx, env.Client, rs)
@@ -3173,8 +3210,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 			ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], pods[2], nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], nodePool)
@@ -3191,8 +3228,8 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
-			ExpectReconcileSucceeded(ctx, queue, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
+			ExpectSingletonReconciled(ctx, queue)
 			wg.Wait()
 
 			// shouldn't delete the node
@@ -3205,11 +3242,11 @@ var _ = Describe("Consolidation", func() {
 			})
 			Expect(ok).To(BeTrue())
 			_, ok = lo.Find(evts, func(e events.Event) bool {
-				return strings.Contains(e.Message, "would schedule against a non-initialized node")
+				return strings.Contains(e.Message, "would schedule against uninitialized nodeclaim")
 			})
 			Expect(ok).To(BeTrue())
 		})
-		It("should consider initialized nodes before un-initialized nodes", func() {
+		It("should consider initialized nodes before uninitialized nodes", func() {
 			defaultInstanceType := fake.NewInstanceType(fake.InstanceTypeOptions{
 				Name: "default-instance-type",
 				Resources: v1.ResourceList{
@@ -3243,8 +3280,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -3265,8 +3302,8 @@ var _ = Describe("Consolidation", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     nodePool.Name,
 							v1.LabelInstanceTypeStable:   defaultInstanceType.Name,
-							v1beta1.CapacityTypeLabelKey: defaultInstanceType.Offerings[0].CapacityType,
-							v1.LabelTopologyZone:         defaultInstanceType.Offerings[0].Zone,
+							v1beta1.CapacityTypeLabelKey: defaultInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         defaultInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -3294,8 +3331,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   smallInstanceType.Name,
-						v1beta1.CapacityTypeLabelKey: smallInstanceType.Offerings[0].CapacityType,
-						v1.LabelTopologyZone:         smallInstanceType.Offerings[0].Zone,
+						v1beta1.CapacityTypeLabelKey: smallInstanceType.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         smallInstanceType.Offerings[0].Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -3318,8 +3355,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -3336,17 +3373,17 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, consolidatableNodeClaim)
-			// Expect no events that state that the pods would schedule against a non-initialized node
+			// Expect no events that state that the pods would schedule against a uninitialized node
 			evts := recorder.Events()
 			_, ok := lo.Find(evts, func(e events.Event) bool {
-				return strings.Contains(e.Message, "would schedule against a non-initialized node")
+				return strings.Contains(e.Message, "would schedule against uninitialized nodeclaim")
 			})
 			Expect(ok).To(BeFalse())
 
@@ -3367,8 +3404,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 
@@ -3392,11 +3429,11 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -3423,8 +3460,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 
@@ -3448,7 +3485,7 @@ var _ = Describe("Consolidation", func() {
 
 			fakeClock.Step(10 * time.Minute)
 
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// No node can be deleted as it would cause one of the three pods to go pending
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(2))
@@ -3482,8 +3519,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 
@@ -3502,11 +3539,11 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -3528,8 +3565,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -3553,7 +3590,7 @@ var _ = Describe("Consolidation", func() {
 				defer GinkgoRecover()
 				defer wg.Done()
 				defer finished.Store(true)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// wait for the controller to block on the validation timeout
@@ -3570,7 +3607,7 @@ var _ = Describe("Consolidation", func() {
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
@@ -3589,23 +3626,23 @@ var _ = Describe("Consolidation", func() {
 			// assign the nodeclaims to the least expensive offering so only one of them gets deleted
 			nodeClaims[0].Labels = lo.Assign(nodeClaims[0].Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-				v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 			nodes[0].Labels = lo.Assign(nodes[0].Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-				v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 			nodeClaims[1].Labels = lo.Assign(nodeClaims[1].Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-				v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 			nodes[1].Labels = lo.Assign(nodes[1].Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-				v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 
 			pods := test.Pods(3, test.PodOptions{
@@ -3616,8 +3653,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 
@@ -3637,7 +3674,7 @@ var _ = Describe("Consolidation", func() {
 			go func() {
 				defer wg.Done()
 				defer finished.Store(true)
-				ExpectReconcileSucceeded(ctx, disruptionController, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// wait for the controller to block on the validation timeout
@@ -3656,7 +3693,7 @@ var _ = Describe("Consolidation", func() {
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -3680,8 +3717,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -3704,7 +3741,7 @@ var _ = Describe("Consolidation", func() {
 				defer GinkgoRecover()
 				defer wg.Done()
 				defer finished.Store(true)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// wait for the disruptionController to block on the validation timeout
@@ -3724,8 +3761,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -3768,7 +3805,7 @@ var _ = Describe("Consolidation", func() {
 				defer GinkgoRecover()
 				defer wg.Done()
 				defer finished.Store(true)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// wait for the disruptionController to block on the validation timeout
@@ -3788,7 +3825,7 @@ var _ = Describe("Consolidation", func() {
 			Eventually(finished.Load, 10*time.Second).Should(BeTrue())
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// nothing should be removed since the node is no longer empty
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
@@ -3813,7 +3850,7 @@ var _ = Describe("Consolidation", func() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// Iterate in a loop until we get to the validation action
@@ -3861,7 +3898,7 @@ var _ = Describe("Consolidation", func() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// Iterate in a loop until we get to the validation action
@@ -3909,7 +3946,7 @@ var _ = Describe("Consolidation", func() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// Iterate in a loop until we get to the validation action
@@ -3960,7 +3997,7 @@ var _ = Describe("Consolidation", func() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// Iterate in a loop until we get to the validation action
@@ -4011,7 +4048,7 @@ var _ = Describe("Consolidation", func() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// Iterate in a loop until we get to the validation action
@@ -4062,7 +4099,7 @@ var _ = Describe("Consolidation", func() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// Iterate in a loop until we get to the validation action
@@ -4106,8 +4143,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -4128,8 +4165,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}},
 				ResourceRequirements: v1.ResourceRequirements{
@@ -4162,7 +4199,7 @@ var _ = Describe("Consolidation", func() {
 				defer GinkgoRecover()
 				defer wg.Done()
 				defer finished.Store(true)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// advance the clock so that the timeout expires
@@ -4185,7 +4222,7 @@ var _ = Describe("Consolidation", func() {
 			Eventually(finished.Load, 10*time.Second).Should(BeTrue())
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// should have at least two nodes deleted from multi nodeClaim consolidation
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(BeNumerically("<=", numNodes-2))
@@ -4197,8 +4234,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -4219,8 +4256,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}},
 				ResourceRequirements: v1.ResourceRequirements{
@@ -4253,7 +4290,7 @@ var _ = Describe("Consolidation", func() {
 				defer GinkgoRecover()
 				defer wg.Done()
 				defer finished.Store(true)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 			}()
 
 			// advance the clock so that the timeout expires for multi-nodeClaim
@@ -4285,8 +4322,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -4301,8 +4338,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -4328,8 +4365,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 
@@ -4349,11 +4386,11 @@ var _ = Describe("Consolidation", func() {
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
 				// Process the item so that the nodes can be deleted.
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0], nodeClaims[1], nodeClaims[2])
@@ -4373,13 +4410,13 @@ var _ = Describe("Consolidation", func() {
 			// Change one of them to spot.
 			nodeClaims[2].Labels = lo.Assign(nodeClaims[2].Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-				v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-				v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 			nodes[2].Labels = lo.Assign(nodeClaims[2].Labels, map[string]string{
 				v1.LabelInstanceTypeStable:   mostExpensiveSpotInstance.Name,
-				v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.CapacityType,
-				v1.LabelTopologyZone:         mostExpensiveSpotOffering.Zone,
+				v1beta1.CapacityTypeLabelKey: mostExpensiveSpotOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+				v1.LabelTopologyZone:         mostExpensiveSpotOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 			})
 			// create our RS so we can link a pod to it
 			rs := test.ReplicaSet()
@@ -4392,8 +4429,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 
@@ -4413,11 +4450,11 @@ var _ = Describe("Consolidation", func() {
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0], nodeClaims[1], nodeClaims[2])
@@ -4444,31 +4481,31 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 
 				// Make the nodeclaims the least expensive instance type and make them of the same type
 				nodeClaims[0].Labels = lo.Assign(nodeClaims[0].Labels, map[string]string{
 					v1.LabelInstanceTypeStable:   leastExpInstance.Name,
-					v1beta1.CapacityTypeLabelKey: leastExpOffering.CapacityType,
-					v1.LabelTopologyZone:         leastExpOffering.Zone,
+					v1beta1.CapacityTypeLabelKey: leastExpOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         leastExpOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 				})
 				nodes[0].Labels = lo.Assign(nodes[0].Labels, map[string]string{
 					v1.LabelInstanceTypeStable:   leastExpInstance.Name,
-					v1beta1.CapacityTypeLabelKey: leastExpOffering.CapacityType,
-					v1.LabelTopologyZone:         leastExpOffering.Zone,
+					v1beta1.CapacityTypeLabelKey: leastExpOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         leastExpOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 				})
 				nodeClaims[1].Labels = lo.Assign(nodeClaims[1].Labels, map[string]string{
 					v1.LabelInstanceTypeStable:   leastExpInstance.Name,
-					v1beta1.CapacityTypeLabelKey: leastExpOffering.CapacityType,
-					v1.LabelTopologyZone:         leastExpOffering.Zone,
+					v1beta1.CapacityTypeLabelKey: leastExpOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         leastExpOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 				})
 				nodes[1].Labels = lo.Assign(nodes[1].Labels, map[string]string{
 					v1.LabelInstanceTypeStable:   leastExpInstance.Name,
-					v1beta1.CapacityTypeLabelKey: leastExpOffering.CapacityType,
-					v1.LabelTopologyZone:         leastExpOffering.Zone,
+					v1beta1.CapacityTypeLabelKey: leastExpOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         leastExpOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 				})
 				ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], pods[2], nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], nodePool)
 				ExpectMakeNodesInitialized(ctx, env.Client, nodes[0], nodes[1])
@@ -4485,11 +4522,11 @@ var _ = Describe("Consolidation", func() {
 
 				var wg sync.WaitGroup
 				ExpectTriggerVerifyAction(&wg)
-				ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+				ExpectSingletonReconciled(ctx, disruptionController)
 				wg.Wait()
 
 				// Process the item so that the nodes can be deleted.
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
@@ -4525,8 +4562,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 
@@ -4549,7 +4586,7 @@ var _ = Describe("Consolidation", func() {
 					defer GinkgoRecover()
 					defer wg.Done()
 					defer finished.Store(true)
-					ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+					ExpectSingletonReconciled(ctx, disruptionController)
 				}()
 
 				// wait for the controller to block on the validation timeout
@@ -4568,7 +4605,7 @@ var _ = Describe("Consolidation", func() {
 				wg.Wait()
 
 				// Process the item so that the nodes can be deleted.
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0], nodeClaims[1])
@@ -4597,8 +4634,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 
@@ -4612,7 +4649,7 @@ var _ = Describe("Consolidation", func() {
 					defer GinkgoRecover()
 					defer wg.Done()
 					defer finished.Store(true)
-					ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+					ExpectSingletonReconciled(ctx, disruptionController)
 				}()
 
 				// wait for the controller to block on the validation timeout
@@ -4644,7 +4681,7 @@ var _ = Describe("Consolidation", func() {
 				wg.Wait()
 
 				// Process the item so that the nodes can be deleted.
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0], nodeClaims[1], nodeClaims[2])
@@ -4673,8 +4710,8 @@ var _ = Describe("Consolidation", func() {
 								Kind:               "ReplicaSet",
 								Name:               rs.Name,
 								UID:                rs.UID,
-								Controller:         ptr.Bool(true),
-								BlockOwnerDeletion: ptr.Bool(true),
+								Controller:         lo.ToPtr(true),
+								BlockOwnerDeletion: lo.ToPtr(true),
 							},
 						}}})
 
@@ -4695,7 +4732,7 @@ var _ = Describe("Consolidation", func() {
 					defer GinkgoRecover()
 					defer wg.Done()
 					defer finished.Store(true)
-					ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+					ExpectSingletonReconciled(ctx, disruptionController)
 				}()
 
 				// wait for the controller to block on the validation timeout
@@ -4739,7 +4776,7 @@ var _ = Describe("Consolidation", func() {
 				wg.Wait()
 
 				// Process the item so that the nodes can be deleted.
-				ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+				ExpectSingletonReconciled(ctx, queue)
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0], nodeClaims[1], nodeClaims[2])
@@ -4765,8 +4802,8 @@ var _ = Describe("Consolidation", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   leastExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         leastExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: leastExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         leastExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -4790,8 +4827,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 
@@ -4813,11 +4850,11 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
@@ -4845,7 +4882,7 @@ var _ = Describe("Consolidation", func() {
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelTopologyZone:         "test-zone-1",
 						v1.LabelInstanceTypeStable:   testZone1Instance.Name,
-						v1beta1.CapacityTypeLabelKey: testZone1Instance.Offerings[0].CapacityType,
+						v1beta1.CapacityTypeLabelKey: testZone1Instance.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -4855,23 +4892,23 @@ var _ = Describe("Consolidation", func() {
 			nodeClaims[1].Labels = lo.Assign(nodeClaims[1].Labels, map[string]string{
 				v1.LabelTopologyZone:         "test-zone-2",
 				v1.LabelInstanceTypeStable:   testZone2Instance.Name,
-				v1beta1.CapacityTypeLabelKey: testZone2Instance.Offerings[0].CapacityType,
+				v1beta1.CapacityTypeLabelKey: testZone2Instance.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
 			})
 			nodes[1].Labels = lo.Assign(nodes[1].Labels, map[string]string{
 				v1.LabelTopologyZone:         "test-zone-2",
 				v1.LabelInstanceTypeStable:   testZone2Instance.Name,
-				v1beta1.CapacityTypeLabelKey: testZone2Instance.Offerings[0].CapacityType,
+				v1beta1.CapacityTypeLabelKey: testZone2Instance.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
 			})
 
 			nodeClaims[2].Labels = lo.Assign(nodeClaims[2].Labels, map[string]string{
 				v1.LabelTopologyZone:         "test-zone-3",
 				v1.LabelInstanceTypeStable:   testZone3Instance.Name,
-				v1beta1.CapacityTypeLabelKey: testZone1Instance.Offerings[0].CapacityType,
+				v1beta1.CapacityTypeLabelKey: testZone3Instance.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
 			})
 			nodes[2].Labels = lo.Assign(nodes[2].Labels, map[string]string{
 				v1.LabelTopologyZone:         "test-zone-3",
 				v1.LabelInstanceTypeStable:   testZone3Instance.Name,
-				v1beta1.CapacityTypeLabelKey: testZone1Instance.Offerings[0].CapacityType,
+				v1beta1.CapacityTypeLabelKey: testZone3Instance.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
 			})
 			oldNodeClaimNames = sets.New(nodeClaims[0].Name, nodeClaims[1].Name, nodeClaims[2].Name)
 		})
@@ -4900,8 +4937,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					}}})
 
@@ -4923,11 +4960,11 @@ var _ = Describe("Consolidation", func() {
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, &wg, cluster, cloudProvider, 1)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// Process the item so that the nodes can be deleted.
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
 
@@ -4972,8 +5009,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -4985,13 +5022,13 @@ var _ = Describe("Consolidation", func() {
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelTopologyZone:         "test-zone-2",
 				v1.LabelInstanceTypeStable:   zone2Instance.Name,
-				v1beta1.CapacityTypeLabelKey: zone2Instance.Offerings[0].CapacityType,
+				v1beta1.CapacityTypeLabelKey: zone2Instance.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
 			})
 			nodeClaims[1].Labels = lo.Assign(nodeClaims[1].Labels, map[string]string{
 				v1beta1.NodePoolLabelKey:     nodePool.Name,
 				v1.LabelTopologyZone:         "test-zone-2",
 				v1.LabelInstanceTypeStable:   zone2Instance.Name,
-				v1beta1.CapacityTypeLabelKey: zone2Instance.Offerings[0].CapacityType,
+				v1beta1.CapacityTypeLabelKey: zone2Instance.Offerings[0].Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
 			})
 			ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], pods[2], nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], nodeClaims[2], nodes[2], nodePool)
 
@@ -5007,7 +5044,7 @@ var _ = Describe("Consolidation", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// our nodes are already the cheapest available, so we can't replace them.  If we delete, it would
@@ -5034,8 +5071,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -5060,7 +5097,7 @@ var _ = Describe("Consolidation", func() {
 			ExpectTriggerVerifyAction(&wg)
 			go func() {
 				defer GinkgoRecover()
-				_, _ = disruptionController.Reconcile(ctx, reconcile.Request{})
+				_, _ = disruptionController.Reconcile(ctx)
 			}()
 			wg.Wait()
 
@@ -5087,8 +5124,8 @@ var _ = Describe("Consolidation", func() {
 							Kind:               "ReplicaSet",
 							Name:               rs.Name,
 							UID:                rs.UID,
-							Controller:         ptr.Bool(true),
-							BlockOwnerDeletion: ptr.Bool(true),
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
 						},
 					},
 				},
@@ -5144,7 +5181,7 @@ var _ = Describe("Consolidation", func() {
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
 
-			result, err := disruptionController.Reconcile(ctx, reconcile.Request{})
+			result, err := disruptionController.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 		})

@@ -27,6 +27,7 @@ import (
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/karpenter/pkg/apis/v1beta1"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -123,6 +124,83 @@ func (its InstanceTypes) Compatible(requirements scheduling.Requirements) Instan
 	return filteredInstanceTypes
 }
 
+// SatisfiesMinValues validates whether the InstanceTypes satisfies the minValues requirements
+// It returns the minimum number of needed instance types to satisfy the minValues requirement and an error
+// that indicates whether the InstanceTypes satisfy the passed-in requirements
+// This minNeededInstanceTypes value is dependent on the ordering of instance types, so relying on this value in a
+// deterministic way implies that the instance types are sorted ahead of using this method
+// For example:
+// Requirements:
+//   - key: node.kubernetes.io/instance-type
+//     operator: In
+//     values: ["c4.large","c4.xlarge","c5.large","c5.xlarge","m4.large","m4.xlarge"]
+//     minValues: 3
+//   - key: karpenter.kwok.sh/instance-family
+//     operator: In
+//     values: ["c4","c5","m4"]
+//     minValues: 3
+//
+// InstanceTypes: ["c4.large","c5.xlarge","m4.2xlarge"], it PASSES the requirements
+//
+//		we get the map as : {
+//			node.kubernetes.io/instance-type:  ["c4.large","c5.xlarge","m4.2xlarge"],
+//			karpenter.k8s.aws/instance-family: ["c4","c5","m4"]
+//		}
+//	 so it returns 3 and a nil error to indicate a minimum of 3 instance types were required to fulfill the minValues requirements
+//
+// And if InstanceTypes: ["c4.large","c4.xlarge","c5.2xlarge"], it FAILS the requirements
+//
+//		we get the map as : {
+//			node.kubernetes.io/instance-type:  ["c4.large","c4.xlarge","c5.2xlarge"],
+//			karpenter.k8s.aws/instance-family: ["c4","c5"] // minimum requirement failed for this.
+//		}
+//	  so it returns 3 and a non-nil error to indicate that the instance types weren't able to fulfill the minValues requirements
+func (its InstanceTypes) SatisfiesMinValues(requirements scheduling.Requirements) (minNeededInstanceTypes int, err error) {
+	valuesForKey := map[string]sets.Set[string]{}
+	// We validate if sorting by price and truncating the number of instance types to minItems breaks the minValue requirement.
+	// If minValue requirement fails, we return an error that indicates the first requirement key that couldn't be satisfied.
+	var incompatibleKey string
+	for i, it := range its {
+		for _, req := range requirements {
+			if req.MinValues != nil {
+				if _, ok := valuesForKey[req.Key]; !ok {
+					valuesForKey[req.Key] = sets.New[string]()
+				}
+				valuesForKey[req.Key] = valuesForKey[req.Key].Insert(it.Requirements.Get(req.Key).Values()...)
+			}
+		}
+		incompatibleKey = func() string {
+			for k, v := range valuesForKey {
+				// Break if any of the MinValues of requirement is not honored
+				if len(v) < lo.FromPtr(requirements.Get(k).MinValues) {
+					return k
+				}
+			}
+			return ""
+		}()
+		if incompatibleKey == "" {
+			return i + 1, nil
+		}
+	}
+	if incompatibleKey != "" {
+		return len(its), fmt.Errorf("minValues requirement is not met for %q", incompatibleKey)
+	}
+	return len(its), nil
+}
+
+// Truncate truncates the InstanceTypes based on the passed-in requirements
+// It returns an error if it isn't possible to truncate the instance types on maxItems without violating minValues
+func (its InstanceTypes) Truncate(requirements scheduling.Requirements, maxItems int) (InstanceTypes, error) {
+	truncatedInstanceTypes := InstanceTypes(lo.Slice(its.OrderByPrice(requirements), 0, maxItems))
+	// Only check for a validity of NodeClaim if its requirement has minValues in it.
+	if requirements.HasMinValues() {
+		if _, err := truncatedInstanceTypes.SatisfiesMinValues(requirements); err != nil {
+			return its, fmt.Errorf("validating minValues, %w", err)
+		}
+	}
+	return truncatedInstanceTypes, nil
+}
+
 type InstanceTypeOverhead struct {
 	// KubeReserved returns the default resources allocated to kubernetes system daemons by default
 	KubeReserved v1.ResourceList
@@ -137,10 +215,11 @@ func (i InstanceTypeOverhead) Total() v1.ResourceList {
 }
 
 // An Offering describes where an InstanceType is available to be used, with the expectation that its properties
-// may be tightly coupled (e.g. the availability of an instance type in some zone is scoped to a capacity type)
+// may be tightly coupled (e.g. the availability of an instance type in some zone is scoped to a capacity type) and
+// these properties are captured with labels in Requirements.
+// Requirements are required to contain the keys v1beta1.CapacityTypeLabelKey and v1.LabelTopologyZone
 type Offering struct {
-	CapacityType string
-	Zone         string
+	Requirements scheduling.Requirements
 	Price        float64
 	// Available is added so that Offerings can return all offerings that have ever existed for an instance type,
 	// so we can get historical pricing data for calculating savings in consolidation
@@ -150,10 +229,10 @@ type Offering struct {
 type Offerings []Offering
 
 // Get gets the offering from an offering slice that matches the
-// passed zone and capacity type
-func (ofs Offerings) Get(ct, zone string) (Offering, bool) {
+// passed zone, capacityType, and other constraints
+func (ofs Offerings) Get(reqs scheduling.Requirements) (Offering, bool) {
 	return lo.Find(ofs, func(of Offering) bool {
-		return of.CapacityType == ct && of.Zone == zone
+		return reqs.Compatible(of.Requirements, scheduling.AllowUndefinedWellKnownLabels) == nil
 	})
 }
 
@@ -167,8 +246,7 @@ func (ofs Offerings) Available() Offerings {
 // Compatible returns the offerings based on the passed requirements
 func (ofs Offerings) Compatible(reqs scheduling.Requirements) Offerings {
 	return lo.Filter(ofs, func(offering Offering, _ int) bool {
-		return (!reqs.Has(v1.LabelTopologyZone) || reqs.Get(v1.LabelTopologyZone).Has(offering.Zone)) &&
-			(!reqs.Has(v1beta1.CapacityTypeLabelKey) || reqs.Get(v1beta1.CapacityTypeLabelKey).Has(offering.CapacityType))
+		return reqs.Compatible(offering.Requirements, scheduling.AllowUndefinedWellKnownLabels) == nil
 	})
 }
 
@@ -176,6 +254,13 @@ func (ofs Offerings) Compatible(reqs scheduling.Requirements) Offerings {
 func (ofs Offerings) Cheapest() Offering {
 	return lo.MinBy(ofs, func(a, b Offering) bool {
 		return a.Price < b.Price
+	})
+}
+
+// MostExpensive returns the most expensive offering from the return offerings
+func (ofs Offerings) MostExpensive() Offering {
+	return lo.MaxBy(ofs, func(a, b Offering) bool {
+		return a.Price > b.Price
 	})
 }
 
@@ -264,36 +349,6 @@ func IsNodeClassNotReadyError(err error) bool {
 
 func IgnoreNodeClassNotReadyError(err error) error {
 	if IsNodeClassNotReadyError(err) {
-		return nil
-	}
-	return err
-}
-
-// RetryableError is an error type returned by CloudProviders when the action emitting the error has to be retried
-type RetryableError struct {
-	error
-}
-
-func NewRetryableError(err error) *RetryableError {
-	return &RetryableError{
-		error: err,
-	}
-}
-
-func (e *RetryableError) Error() string {
-	return fmt.Sprintf("retryable error, %s", e.error)
-}
-
-func IsRetryableError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var retryableError *RetryableError
-	return errors.As(err, &retryableError)
-}
-
-func IgnoreRetryableError(err error) error {
-	if IsRetryableError(err) {
 		return nil
 	}
 	return err

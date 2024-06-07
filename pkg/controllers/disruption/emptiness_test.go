@@ -27,11 +27,10 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha5"
 	"sigs.k8s.io/karpenter/pkg/apis/v1beta1"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -60,8 +59,8 @@ var _ = Describe("Emptiness", func() {
 				Labels: map[string]string{
 					v1beta1.NodePoolLabelKey:     nodePool.Name,
 					v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-					v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-					v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+					v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+					v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 				},
 			},
 			Status: v1beta1.NodeClaimStatus{
@@ -72,7 +71,7 @@ var _ = Describe("Emptiness", func() {
 				},
 			},
 		})
-		nodeClaim.StatusConditions().MarkTrue(v1beta1.Empty)
+		nodeClaim.StatusConditions().SetTrue(v1beta1.ConditionTypeEmpty)
 	})
 	Context("Events", func() {
 		It("should not fire an event for ConsolidationDisabled when the NodePool has consolidation set to WhenUnderutilized", func() {
@@ -84,7 +83,7 @@ var _ = Describe("Emptiness", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			Expect(recorder.Calls("Unconsolidatable")).To(Equal(0))
@@ -97,12 +96,45 @@ var _ = Describe("Emptiness", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			// We get six calls here because we have Nodes and NodeClaims that fired for this event
 			// and each of the consolidation mechanisms specifies that this event should be fired
 			Expect(recorder.Calls("Unconsolidatable")).To(Equal(2))
+		})
+	})
+	Context("Metrics", func() {
+		var eligibleNodesEmptinessLabels = map[string]string{
+			"method":             "emptiness",
+			"consolidation_type": "",
+		}
+		It("should correctly report eligible nodes", func() {
+			pod := test.Pod()
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*v1.Node{node}, []*v1beta1.NodeClaim{nodeClaim})
+
+			fakeClock.Step(10 * time.Minute)
+			wg := sync.WaitGroup{}
+			ExpectTriggerVerifyAction(&wg)
+			ExpectSingletonReconciled(ctx, disruptionController)
+			wg.Wait()
+
+			ExpectMetricGaugeValue(disruption.EligibleNodesGauge, 0, eligibleNodesEmptinessLabels)
+
+			// delete pod and update cluster state, node should now be disruptable
+			ExpectDeleted(ctx, env.Client, pod)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*v1.Node{node}, []*v1beta1.NodeClaim{nodeClaim})
+
+			fakeClock.Step(10 * time.Minute)
+			ExpectTriggerVerifyAction(&wg)
+			ExpectSingletonReconciled(ctx, disruptionController)
+			wg.Wait()
+
+			ExpectMetricGaugeValue(disruption.EligibleNodesGauge, 1, eligibleNodesEmptinessLabels)
 		})
 	})
 	Context("Budgets", func() {
@@ -115,8 +147,8 @@ var _ = Describe("Emptiness", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -130,7 +162,7 @@ var _ = Describe("Emptiness", func() {
 
 			ExpectApplied(ctx, env.Client, nodePool)
 			for i := 0; i < numNodes; i++ {
-				nodeClaims[i].StatusConditions().MarkTrue(v1beta1.Empty)
+				nodeClaims[i].StatusConditions().SetTrue(v1beta1.ConditionTypeEmpty)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
@@ -142,7 +174,7 @@ var _ = Describe("Emptiness", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			metric, found := FindMetricWithLabelValues("karpenter_disruption_budgets_allowed_disruptions", map[string]string{
@@ -152,7 +184,7 @@ var _ = Describe("Emptiness", func() {
 			Expect(metric.GetGauge().GetValue()).To(BeNumerically("==", 10))
 
 			// Execute command, thus deleting 10 nodes
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(0))
 		})
 		It("should allow no empty nodes to be disrupted", func() {
@@ -161,8 +193,8 @@ var _ = Describe("Emptiness", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -176,7 +208,7 @@ var _ = Describe("Emptiness", func() {
 
 			ExpectApplied(ctx, env.Client, nodePool)
 			for i := 0; i < numNodes; i++ {
-				nodeClaims[i].StatusConditions().MarkTrue(v1beta1.Empty)
+				nodeClaims[i].StatusConditions().SetTrue(v1beta1.ConditionTypeEmpty)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
@@ -188,7 +220,7 @@ var _ = Describe("Emptiness", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			metric, found := FindMetricWithLabelValues("karpenter_disruption_budgets_allowed_disruptions", map[string]string{
@@ -198,7 +230,7 @@ var _ = Describe("Emptiness", func() {
 			Expect(metric.GetGauge().GetValue()).To(BeNumerically("==", 0))
 
 			// Execute command, thus deleting no nodes
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(numNodes))
 		})
 		It("should only allow 3 empty nodes to be disrupted", func() {
@@ -207,8 +239,8 @@ var _ = Describe("Emptiness", func() {
 					Labels: map[string]string{
 						v1beta1.NodePoolLabelKey:     nodePool.Name,
 						v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-						v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+						v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+						v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 					},
 				},
 				Status: v1beta1.NodeClaimStatus{
@@ -222,7 +254,7 @@ var _ = Describe("Emptiness", func() {
 
 			ExpectApplied(ctx, env.Client, nodePool)
 			for i := 0; i < numNodes; i++ {
-				nodeClaims[i].StatusConditions().MarkTrue(v1beta1.Empty)
+				nodeClaims[i].StatusConditions().SetTrue(v1beta1.ConditionTypeEmpty)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
@@ -234,7 +266,7 @@ var _ = Describe("Emptiness", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			metric, found := FindMetricWithLabelValues("karpenter_disruption_budgets_allowed_disruptions", map[string]string{
@@ -244,7 +276,7 @@ var _ = Describe("Emptiness", func() {
 			Expect(metric.GetGauge().GetValue()).To(BeNumerically("==", 3))
 
 			// Execute command, thus deleting 3 nodes
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(7))
 		})
 		It("should allow 2 nodes from each nodePool to be deleted", func() {
@@ -275,8 +307,8 @@ var _ = Describe("Emptiness", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     np.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -291,7 +323,7 @@ var _ = Describe("Emptiness", func() {
 			}
 			ExpectApplied(ctx, env.Client, nodePool)
 			for i := 0; i < len(nodeClaims); i++ {
-				nodeClaims[i].StatusConditions().MarkTrue(v1beta1.Empty)
+				nodeClaims[i].StatusConditions().SetTrue(v1beta1.ConditionTypeEmpty)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
@@ -303,7 +335,7 @@ var _ = Describe("Emptiness", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			for _, np := range nps {
@@ -315,7 +347,7 @@ var _ = Describe("Emptiness", func() {
 			}
 
 			// Execute the command in the queue, only deleting 20 nodes
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(10))
 		})
 		It("should allow all nodes from each nodePool to be deleted", func() {
@@ -345,8 +377,8 @@ var _ = Describe("Emptiness", func() {
 						Labels: map[string]string{
 							v1beta1.NodePoolLabelKey:     np.Name,
 							v1.LabelInstanceTypeStable:   mostExpensiveInstance.Name,
-							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.CapacityType,
-							v1.LabelTopologyZone:         mostExpensiveOffering.Zone,
+							v1beta1.CapacityTypeLabelKey: mostExpensiveOffering.Requirements.Get(v1beta1.CapacityTypeLabelKey).Any(),
+							v1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(v1.LabelTopologyZone).Any(),
 						},
 					},
 					Status: v1beta1.NodeClaimStatus{
@@ -361,7 +393,7 @@ var _ = Describe("Emptiness", func() {
 			}
 			ExpectApplied(ctx, env.Client, nodePool)
 			for i := 0; i < len(nodeClaims); i++ {
-				nodeClaims[i].StatusConditions().MarkTrue(v1beta1.Empty)
+				nodeClaims[i].StatusConditions().SetTrue(v1beta1.ConditionTypeEmpty)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
@@ -373,7 +405,7 @@ var _ = Describe("Emptiness", func() {
 
 			var wg sync.WaitGroup
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, client.ObjectKey{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
 			for _, np := range nps {
@@ -385,7 +417,7 @@ var _ = Describe("Emptiness", func() {
 			}
 
 			// Execute the command in the queue, deleting all nodes
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(0))
 		})
 	})
@@ -399,10 +431,10 @@ var _ = Describe("Emptiness", func() {
 			fakeClock.Step(10 * time.Minute)
 			wg := sync.WaitGroup{}
 			ExpectTriggerVerifyAction(&wg)
-			ExpectReconcileSucceeded(ctx, disruptionController, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 			wg.Wait()
 
-			ExpectReconcileSucceeded(ctx, queue, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, queue)
 			// Cascade any deletion of the nodeClaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
@@ -412,13 +444,13 @@ var _ = Describe("Emptiness", func() {
 			ExpectNotFound(ctx, env.Client, nodeClaim, node)
 		})
 		It("should ignore nodes without the empty status condition", func() {
-			_ = nodeClaim.StatusConditions().ClearCondition(v1beta1.Empty)
+			_ = nodeClaim.StatusConditions().Clear(v1beta1.ConditionTypeEmpty)
 			ExpectApplied(ctx, env.Client, nodeClaim, node, nodePool)
 
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*v1.Node{node}, []*v1beta1.NodeClaim{nodeClaim})
 
-			ExpectReconcileSucceeded(ctx, disruptionController, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Expect to not create or delete more nodeclaims
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
@@ -432,7 +464,7 @@ var _ = Describe("Emptiness", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*v1.Node{node}, []*v1beta1.NodeClaim{nodeClaim})
 
-			ExpectReconcileSucceeded(ctx, disruptionController, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Expect to not create or delete more nodeclaims
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
@@ -453,7 +485,7 @@ var _ = Describe("Emptiness", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*v1.Node{node}, []*v1beta1.NodeClaim{nodeClaim})
 
-			ExpectReconcileSucceeded(ctx, disruptionController, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Expect to not create or delete more nodeclaims
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
@@ -474,7 +506,7 @@ var _ = Describe("Emptiness", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*v1.Node{node}, []*v1beta1.NodeClaim{nodeClaim})
 
-			ExpectReconcileSucceeded(ctx, disruptionController, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Expect to not create or delete more nodeclaims
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
@@ -482,7 +514,7 @@ var _ = Describe("Emptiness", func() {
 			ExpectExists(ctx, env.Client, nodeClaim)
 		})
 		It("should ignore nodes with the empty status condition set to false", func() {
-			nodeClaim.StatusConditions().MarkFalse(v1beta1.Empty, "", "")
+			nodeClaim.StatusConditions().SetFalse(v1beta1.ConditionTypeEmpty, "NotEmpty", "NotEmpty")
 			ExpectApplied(ctx, env.Client, nodeClaim, node, nodePool)
 
 			// inform cluster state about nodes and nodeclaims
@@ -490,7 +522,7 @@ var _ = Describe("Emptiness", func() {
 
 			fakeClock.Step(10 * time.Minute)
 
-			ExpectReconcileSucceeded(ctx, disruptionController, types.NamespacedName{})
+			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Expect to not create or delete more nodeclaims
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))

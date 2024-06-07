@@ -17,6 +17,7 @@ limitations under the License.
 package controllers
 
 import (
+	"github.com/awslabs/operatorpkg/controller"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -40,7 +41,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/events"
-	"sigs.k8s.io/karpenter/pkg/operator/controller"
 )
 
 func NewControllers(

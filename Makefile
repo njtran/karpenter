@@ -6,7 +6,7 @@ HELM_OPTS ?= --set logLevel=debug \
 			--set controller.resources.requests.cpu=1 \
 			--set controller.resources.requests.memory=1Gi \
 			--set controller.resources.limits.cpu=1 \
-			--set controller.resources.limits.memory=1Gi 
+			--set controller.resources.limits.memory=1Gi
 
 help: ## Display help
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
@@ -19,10 +19,10 @@ install-kwok: ## Install kwok provider
 uninstall-kwok: ## Uninstall kwok provider
 	UNINSTALL_KWOK=true ./hack/install-kwok.sh
 
-build-with-kind: 
+build-with-kind: # build with kind assumes the image will be uploaded directly onto the kind control plane, without an image repository
 	$(eval CONTROLLER_IMG=$(shell $(WITH_GOFLAGS) KO_DOCKER_REPO="$(KWOK_REPO)" ko build sigs.k8s.io/karpenter/kwok))
-	$(eval IMG_REPOSITORY=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 1))
-	$(eval IMG_TAG=latest)
+	$(eval IMG_REPOSITORY=$(shell echo $(CONTROLLER_IMG) | cut -d ":" -f 1))
+	$(eval IMG_TAG=latest) 
 
 build: ## Build the Karpenter KWOK controller images using ko build
 	$(eval CONTROLLER_IMG=$(shell $(WITH_GOFLAGS) KO_DOCKER_REPO="$(KWOK_REPO)" ko build -B sigs.k8s.io/karpenter/kwok))
@@ -31,20 +31,30 @@ build: ## Build the Karpenter KWOK controller images using ko build
 	$(eval IMG_DIGEST=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 2))
 	
 apply-with-kind: verify build-with-kind ## Deploy the kwok controller from the current state of your git repository into your ~/.kube/config cluster
-	hack/validation/kwok-requirements.sh
-	kubectl apply -f pkg/apis/crds
+	kubectl apply -f kwok/charts/crds
 	helm upgrade --install karpenter kwok/charts --namespace $(KARPENTER_NAMESPACE) --skip-crds \
 		$(HELM_OPTS) \
 		--set controller.image.repository=$(IMG_REPOSITORY) \
 		--set controller.image.tag=$(IMG_TAG) \
+		--set serviceMonitor.enabled=true \
 		--set-string controller.env[0].name=ENABLE_PROFILING \
-		--set-string controller.env[0].value=true
+		--set-string controller.env[0].value=true 
+
+e2etests: ## Run the e2e suite against your local cluster
+	cd test && go test \
+		-count 1 \
+		-timeout 30m \
+		-v \
+		./suites/$(shell echo $(TEST_SUITE) | tr A-Z a-z)/... \
+		--ginkgo.focus="${FOCUS}" \
+		--ginkgo.timeout=30m \
+		--ginkgo.grace-period=30m \
+		--ginkgo.vv	
 
 # Run make install-kwok to install the kwok controller in your cluster first
 # Webhooks are currently not supported in the kwok provider.
 apply: verify build ## Deploy the kwok controller from the current state of your git repository into your ~/.kube/config cluster
-	hack/validation/kwok-requirements.sh
-	kubectl apply -f pkg/apis/crds
+	kubectl apply -f kwok/charts/crds
 	helm upgrade --install karpenter kwok/charts --namespace $(KARPENTER_NAMESPACE) --skip-crds \
 		$(HELM_OPTS) \
 		--set controller.image.repository=$(IMG_REPOSITORY) \
@@ -54,7 +64,7 @@ apply: verify build ## Deploy the kwok controller from the current state of your
 
 delete: ## Delete the controller from your ~/.kube/config cluster
 	helm uninstall karpenter --namespace $(KARPENTER_NAMESPACE)
-	
+
 test: ## Run tests
 	go test ./... \
 		-race \
@@ -88,6 +98,9 @@ verify: ## Verify code. Includes codegen, docgen, dependencies, linting, formatt
 	hack/validation/requirements.sh
 	hack/validation/labels.sh
 	hack/validation/resources.sh
+	hack/validation/status.sh
+	cp -r pkg/apis/crds kwok/charts
+	hack/validation/kwok-requirements.sh
 	hack/dependabot.sh
 	@# Use perl instead of sed due to https://stackoverflow.com/questions/4247068/sed-command-with-i-option-failing-on-mac-but-works-on-linux
 	@# We need to do this "sed replace" until controller-tools fixes this parameterized types issue: https://github.com/kubernetes-sigs/controller-tools/issues/756
@@ -103,4 +116,7 @@ download: ## Recursively "go mod download" on all directories where go.mod exist
 toolchain: ## Install developer toolchain
 	./hack/toolchain.sh
 
-.PHONY: help presubmit install-kwok uninstall-kwok build apply delete test deflake vulncheck licenses verify download toolchain
+gen_instance_types:
+	go run kwok/tools/gen_instance_types.go > kwok/cloudprovider/instance_types.json
+
+.PHONY: help presubmit install-kwok uninstall-kwok build apply delete test deflake vulncheck licenses verify download toolchain gen_instance_types
